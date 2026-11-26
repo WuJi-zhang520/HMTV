@@ -17,8 +17,8 @@ except Exception:
 
 HOST = "http://cms.lyyytv.cn"
 UA = "okhttp/4.12.0"
-CHAIN_API = "http://fys.lyyytv.cn/api/index?parsesId=6&appid=10001&videoUrl="
-PARSE_API = "http://fys.lyyytv.cn/api/index?parsesId=5&appid=10001&videoUrl="
+CHAIN_API = "http://fys.lyyytv.cn/api/index?parsesId=8&appid=10001&videoUrl="
+PARSE_API = "http://fys.lyyytv.cn/api/index?parsesId=8&appid=10001&videoUrl="
 CMS_KEY = "wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy"
 DEC_PREFIX = "https://baidu.con/"
 YT4K_HOST = re.compile(r"(?:^|\.)(?:ym4kjx|hd4kjx|sd4kjx|mm4kjx|mv4kjx|vk4kjx)\.lyyytv\.cn$", re.I)
