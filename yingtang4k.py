@@ -1,33 +1,114 @@
 # coding: utf-8
-# 影探4K（cms.lyyytv.cn）· TVBox / FongMi Python 站源
-# 站型：苹果CMS 的 app 接口（/api.php/app/*）；播放走 fys 解析（parsesId=6 专线 / 5 通用），
-#       返回 https://baidu.con/<key16><base64> 形态，用「前 16 字符当 key/iv」AES-CBC 解。
+# 河豚4K（lee_hetun4k）TVBox / FongMi Python 站源
+# 协议：自定义 protobuf + RSA(PKCS#1 v1.5) 设备签名 + AES(ECB/CBC) 参数加密
+# 纯标准库实现（自带 AES 加密与 RSA 公钥加密），不依赖 pycryptodome / requests
 import base64
 import json
+import os
 import re
 import time
-import urllib.parse
-import urllib.request
+import uuid
 
-try:
-    from base.spider import Spider as BaseSpider
-except Exception:
-    class BaseSpider(object):
-        pass
+from base.spider import Spider as BaseSpider
 
-HOST = "http://cms.lyyytv.cn"
-UA = "okhttp/4.12.0"
-CHAIN_API = "http://fys.lyyytv.cn/api/index?parsesId=8&appid=10001&videoUrl="
-PARSE_API = "http://fys.lyyytv.cn/api/index?parsesId=8&appid=10001&videoUrl="
-CMS_KEY = "wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy"
-DEC_PREFIX = "https://baidu.con/"
-YT4K_HOST = re.compile(r"(?:^|\.)(?:ym4kjx|hd4kjx|sd4kjx|mm4kjx|mv4kjx|vk4kjx)\.lyyytv\.cn$", re.I)
-MEDIA_RE = re.compile(r"\.(?:mp4|m3u8|m3u|flv|mkv|ts|mov|webm|m4v|mpd)(?:[?#]|$)", re.I)
-FILTER_KEYS = [("class", "类型"), ("area", "地区"), ("lang", "语言"), ("year", "年份"),
-               ("letter", "字母"), ("by", "排序"), ("sort", "顺序"), ("star", "主演"),
-               ("director", "导演"), ("state", "状态"), ("version", "版本")]
+CFG = {
+    "app_name": "河豚",
+    "public_key": "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCr8SzZhjYy+rsya1K09t8d2K50pWFoBkgUqMpKOiW+3IEVKd4eTdvg9RSOjQ82kypL6R9BnsmrS1V8s4PVDwjQbUtYhTPPC9Hz16qY7rpD6m0d2vr09/UpWQ5uOy9PR0QTrsioveZ+DIe9jc3C+zBCu/kZSY/R8stwJoiitki3gwIDAQAB",
+    "safe_code": "V04XQZNYRWN6T0JODZFIAG5CTZB3PT0=",
+    "data_iv": "OC1A06E197EF10CF3F6058CA7A803B5E",
+    "pkg": "com.djlxxl.xcydzkj",
+    "boot": "https://az1-1456692500.cos.ap-guangzhou.myqcloud.com/az1.txt",
+    "v_name": "7.0.0.2",
+    "device_key": "ed5fdsgucxumegqa",
+}
 
-# ---------------------------------------------------------------- AES（解密用）
+UA = "okhttp/3.12.1"
+MEDIA_RE = re.compile(r"\.(?:mp4|m3u8|flv|mkv|avi|ts|mov|mpd|m4a|wmv)(?:\?.*)?$", re.I)
+
+
+# --------------------------------------------------------------------------
+# protobuf（只用到 varint 与 length-delimited）
+# --------------------------------------------------------------------------
+def _varint(n):
+    out = bytearray()
+    n = int(n)
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def _p_int(field, value):
+    return _varint(field << 3) + _varint(value)
+
+
+def _p_bytes(field, value):
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    return _varint((field << 3) | 2) + _varint(len(value)) + value
+
+
+def _parse(buf):
+    """返回 {field: [value, ...]}，varint 为 int，其余为 bytes。"""
+    out = {}
+    pos = 0
+    n = len(buf)
+    while pos < n:
+        tag, pos = _read_varint(buf, pos)
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            val, pos = _read_varint(buf, pos)
+        elif wire == 2:
+            ln, pos = _read_varint(buf, pos)
+            val = buf[pos:pos + ln]
+            pos += ln
+        elif wire == 1:
+            val = buf[pos:pos + 8]
+            pos += 8
+        elif wire == 5:
+            val = buf[pos:pos + 4]
+            pos += 4
+        else:
+            break
+        out.setdefault(field, []).append(val)
+    return out
+
+
+def _read_varint(buf, pos):
+    n = 0
+    shift = 0
+    while pos < len(buf):
+        b = buf[pos]
+        pos += 1
+        n |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return n, pos
+        shift += 7
+    raise ValueError("bad varint")
+
+
+def _one(fields, num, default=None):
+    v = fields.get(num)
+    if not v:
+        return default
+    return v[0]
+
+
+def _s(value, default=""):
+    if value is None:
+        return default
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "ignore")
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
+
+
+# --------------------------------------------------------------------------
+# AES（只做加密：ECB / CBC + PKCS7），S 盒按 GF(2^8) 定义现算
+# --------------------------------------------------------------------------
 def _gmul(a, b):
     p = 0
     for _ in range(8):
@@ -44,7 +125,10 @@ def _gmul(a, b):
 def _build_sbox():
     inv = [0] * 256
     for i in range(1, 256):
-        r, base, e = 1, i, 254
+        # 乘法逆元：i^254
+        r = 1
+        base = i
+        e = 254
         while e:
             if e & 1:
                 r = _gmul(r, base)
@@ -55,28 +139,29 @@ def _build_sbox():
     def rotl(x, n):
         return ((x << n) | (x >> (8 - n))) & 0xFF
 
-    return [inv[i] ^ rotl(inv[i], 1) ^ rotl(inv[i], 2) ^ rotl(inv[i], 3) ^ rotl(inv[i], 4) ^ 0x63
-            for i in range(256)]
+    box = [0] * 256
+    for i in range(256):
+        x = inv[i]
+        box[i] = x ^ rotl(x, 1) ^ rotl(x, 2) ^ rotl(x, 3) ^ rotl(x, 4) ^ 0x63
+    return box
 
 
 SBOX = _build_sbox()
-INV_SBOX = [0] * 256
-for _i, _v in enumerate(SBOX):
-    INV_SBOX[_v] = _i
 RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36, 0x6C, 0xD8, 0xAB, 0x4D]
 
 
 class _AES(object):
     def __init__(self, key):
         if len(key) not in (16, 24, 32):
-            raise ValueError("bad key")
+            raise ValueError("bad aes key length %d" % len(key))
         self.nk = len(key) // 4
         self.nr = self.nk + 6
         self.rk = self._expand(key)
 
     def _expand(self, key):
         w = [list(key[i:i + 4]) for i in range(0, len(key), 4)]
-        for i in range(self.nk, 4 * (self.nr + 1)):
+        total = 4 * (self.nr + 1)
+        for i in range(self.nk, total):
             t = list(w[i - 1])
             if i % self.nk == 0:
                 t = t[1:] + t[:1]
@@ -92,7 +177,7 @@ class _AES(object):
             for r in range(4):
                 s[r][c] ^= self.rk[rnd * 4 + c][r]
 
-    def enc(self, block):
+    def encrypt_block(self, block):
         s = [[block[r + 4 * c] for c in range(4)] for r in range(4)]
         self._add(s, 0)
         for rnd in range(1, self.nr + 1):
@@ -111,326 +196,492 @@ class _AES(object):
             self._add(s, rnd)
         return bytes(s[r][c] for c in range(4) for r in range(4))
 
-    def dec(self, block):
-        s = [[block[r + 4 * c] for c in range(4)] for r in range(4)]
-        self._add(s, self.nr)
-        for rnd in range(self.nr - 1, -1, -1):
-            for r in range(1, 4):
-                s[r] = s[r][-r:] + s[r][:-r]
-            for r in range(4):
-                for c in range(4):
-                    s[r][c] = INV_SBOX[s[r][c]]
-            self._add(s, rnd)
-            if rnd != 0:
-                for c in range(4):
-                    a0, a1, a2, a3 = s[0][c], s[1][c], s[2][c], s[3][c]
-                    s[0][c] = _gmul(a0, 14) ^ _gmul(a1, 11) ^ _gmul(a2, 13) ^ _gmul(a3, 9)
-                    s[1][c] = _gmul(a0, 9) ^ _gmul(a1, 14) ^ _gmul(a2, 11) ^ _gmul(a3, 13)
-                    s[2][c] = _gmul(a0, 13) ^ _gmul(a1, 9) ^ _gmul(a2, 14) ^ _gmul(a3, 11)
-                    s[3][c] = _gmul(a0, 11) ^ _gmul(a1, 13) ^ _gmul(a2, 9) ^ _gmul(a3, 14)
-        return bytes(s[r][c] for c in range(4) for r in range(4))
 
-
-def _aes_cbc_enc(data, key, iv):
-    aes = _AES(key)
+def _pad(data):
     n = 16 - len(data) % 16
-    data = data + bytes([n]) * n
-    out, prev = bytearray(), iv
+    return data + bytes([n]) * n
+
+
+_AES_CACHE = {}
+
+
+def _aes(key):
+    inst = _AES_CACHE.get(key)
+    if inst is None:
+        inst = _AES(key)
+        _AES_CACHE[key] = inst
+    return inst
+
+
+def _aes_ecb(data, key):
+    aes = _aes(key)
+    data = _pad(data)
+    return b"".join(aes.encrypt_block(data[i:i + 16]) for i in range(0, len(data), 16))
+
+
+def _aes_cbc(data, key):
+    aes = _aes(key)
+    data = _pad(data)
+    iv = list(key)
+    out = bytearray()
     for i in range(0, len(data), 16):
-        blk = bytes(data[i + j] ^ prev[j] for j in range(16))
-        enc = aes.enc(blk)
+        block = [data[i + j] ^ iv[j] for j in range(16)]
+        enc = aes.encrypt_block(bytes(block))
         out += enc
-        prev = enc
+        iv = list(enc)
     return bytes(out)
 
 
-def _aes_cbc_dec(data, key, iv):
-    aes = _AES(key)
-    out, prev = bytearray(), iv
-    for i in range(0, len(data), 16):
-        blk = data[i:i + 16]
-        dec = aes.dec(blk)
-        out += bytes(dec[j] ^ prev[j] for j in range(16))
-        prev = blk
-    n = out[-1]
-    return bytes(out[:-n])
-
-# ---------------------------------------------------------------- 工具
-
-
-def _clean(s):
-    s = str(s or "")
-    s = re.sub(r"<[^>]+>", "", s)
-    s = s.replace("&amp;nbsp;", " ").replace("&nbsp;", " ").replace("&amp;", "&")
-    return " ".join(s.split()).strip()
+# --------------------------------------------------------------------------
+# RSA 公钥加密（PKCS#1 v1.5），DER/SPKI 手工解析
+# --------------------------------------------------------------------------
+def _der_tlv(buf, pos):
+    tag = buf[pos]
+    pos += 1
+    ln = buf[pos]
+    pos += 1
+    if ln & 0x80:
+        cnt = ln & 0x7F
+        ln = int.from_bytes(buf[pos:pos + cnt], "big")
+        pos += cnt
+    return tag, buf[pos:pos + ln], pos + ln
 
 
-def _safe(s):
-    return _clean(s).replace("$", " ").replace("#", " ").strip()
+def _rsa_public(der):
+    _, body, _ = _der_tlv(der, 0)          # SEQUENCE
+    _, _, p = _der_tlv(body, 0)            # AlgorithmIdentifier
+    _, bitstr, _ = _der_tlv(body, p)       # BIT STRING
+    inner = bitstr[1:]                     # 跳过 unused-bits
+    _, rsa_seq, _ = _der_tlv(inner, 0)
+    _, n_raw, p = _der_tlv(rsa_seq, 0)
+    _, e_raw, _ = _der_tlv(rsa_seq, p)
+    return int.from_bytes(n_raw, "big"), int.from_bytes(e_raw, "big")
 
 
-def _fix(u):
-    u = str(u or "").strip()
-    if u.startswith("//"):
-        u = "http:" + u
-    return u
+_RSA_CACHE = {}
 
 
-def _decrypt_baidu(url):
-    """https://baidu.con/<16 chars key><base64(ct)> → AES-CBC(key,key) 明文"""
-    if not url or not url.startswith(DEC_PREFIX):
+def _rsa_encrypt(text, public_key_b64):
+    if public_key_b64 not in _RSA_CACHE:
+        _RSA_CACHE[public_key_b64] = _rsa_public(base64.b64decode(public_key_b64))
+    n, e = _RSA_CACHE[public_key_b64]
+    k = (n.bit_length() + 7) // 8
+    msg = text.encode("utf-8")
+    if len(msg) > k - 11:
+        raise ValueError("rsa message too long")
+    ps = bytearray()
+    while len(ps) < k - 3 - len(msg):
+        chunk = os.urandom(k - 3 - len(msg) - len(ps))
+        ps += bytes(b for b in chunk if b)
+    block = b"\x00\x02" + bytes(ps) + b"\x00" + msg
+    return base64.b64encode(pow(int.from_bytes(block, "big"), e, n).to_bytes(k, "big")).decode()
+
+
+# --------------------------------------------------------------------------
+def _rand(n):
+    raw = base64.b64encode(os.urandom(n)).decode()
+    raw = re.sub(r"[^A-Za-z0-9]", "", raw)
+    return (raw + "A" * n)[:n - 1] + "="
+
+
+def _clean_html(text):
+    text = _s(text)
+    if not text:
         return ""
-    body = url[len(DEC_PREFIX):]
-    if len(body) <= 16:
-        return ""
-    key = body[:16].encode()
-    ct = body[16:]
-    try:
-        raw = base64.b64decode(ct + "=" * (-len(ct) % 4))
-    except Exception:
-        return ""
-    if not raw or len(raw) % 16:
-        return ""
-    try:
-        text = _aes_cbc_dec(raw, key, key).decode("utf-8", "ignore")
-    except Exception:
-        return ""
-    return text if text.startswith("http") else ""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", text)
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", '"').replace("&#39;", "'"))
+    return re.sub(r"[ \t]+", " ", text).strip()
 
 
 class Spider(BaseSpider):
+    # 跨实例共享：域名 + 动态公钥（壳子可能每次调用重建 Spider）
+    _shared = {"host": "", "key": "", "ts": 0}
+
+    # ---- 基础信息 -------------------------------------------------------
     def getName(self):
-        return "影探4K"
+        return "河豚4K"
 
     def getDependence(self):
         return []
 
     def setExtendInfo(self, extend):
-        pass
+        return None
 
     def init(self, extend=""):
-        self.host = HOST
-        try:
-            if isinstance(extend, str) and extend.strip().startswith("{"):
-                cfg = json.loads(str(extend))
-                if cfg.get("host"):
-                    self.host = str(cfg["host"]).rstrip("/")
-        except Exception:
-            pass
+        # 保持轻量：域名与握手都延迟到首次请求
+        self._host = ""
+        self._dyn_key = ""
+        self._primed = False
 
-    # ---------------------------------------------------------------- HTTP
-    def _get(self, url, timeout=20):
-        h = {"User-Agent": UA, "Accept-Encoding": "identity", "Accept": "application/json"}
+    # ---- 网络 ----------------------------------------------------------
+    def _http(self, url, method="GET", body=None, headers=None, timeout=18):
+        hdrs = {"User-Agent": UA}
+        if headers:
+            hdrs.update(headers)
+        # 基类的 fetch()/post() 各分支签名不一致、且多数返回 str 而不是 Response，
+        # 这里统一用 urllib 取数，避免 getattr(r, "content") 静默拿到空字节。
+        import ssl as _ssl
+        from urllib.request import Request as _Req, urlopen as _open
         for _ in range(2):
             try:
-                r = urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
-                txt = r.read().decode("utf-8", "ignore")
+                req = _Req(url, data=body if method != "GET" else None, method=method)
+                for k, v in hdrs.items():
+                    req.add_header(k, v)
                 try:
-                    return json.loads(txt)
-                except Exception:
-                    return {"__raw": txt[:200]}
-            except Exception:
+                    ctx = _ssl.create_default_context()
+                    with _open(req, timeout=timeout, context=ctx) as r:
+                        return r.read() or b""
+                except _ssl.SSLError:
+                    with _open(req, timeout=timeout,
+                               context=_ssl._create_unverified_context()) as r:
+                        return r.read() or b""
+            except Exception as e:
+                last = e
                 time.sleep(0.4)
-        return {}
+        return b""
 
-    def _cms(self, action, params):
-        q = urllib.parse.urlencode(params or {})
-        return self._get("%s/api.php/app/%s?%s" % (self.host, action, q))
-
-    # ---------------------------------------------------------------- 首页
-    def homeContent(self, filter):
-        j = self._cms("nav", {"token": ""})
-        classes, filters = [], {}
-        for c in (j.get("list") or []):
-            tid = str(c.get("type_id") or "")
-            name = _clean(c.get("type_name"))
-            if not tid or not name:
-                continue
-            classes.append({"type_id": tid, "type_name": name})
-            fl = []
-            ext = c.get("type_extend") or {}
-            if filter:
-                for key, label in FILTER_KEYS:
-                    raw = _clean(ext.get(key))
-                    if not raw:
-                        continue
-                    vals = []
-                    seen = set()
-                    for v in raw.split(","):
-                        v = v.strip()
-                        if not v or v in seen:
-                            continue
-                        seen.add(v)
-                        vals.append({"n": v, "v": v})
-                    if len(vals) > 1:
-                        fl.append({"key": key, "name": label,
-                                   "value": [{"n": "全部", "v": ""}] + vals})
-            filters[tid] = fl or []
-        if not classes:
-            classes = [{"type_id": "1", "type_name": "电影"}]
-        return {"class": classes, "filters": filters}
-
-    def homeVideoContent(self):
-        j = self._cms("index_video", {"token": ""})
-        out = []
-        for block in (j.get("list") or []):
-            for it in (block.get("vlist") or []) if isinstance(block, dict) else []:
-                v = self._item(it)
-                if v:
-                    out.append(v)
-        return {"list": out}
-
-    def _item(self, it):
-        if not isinstance(it, dict):
-            return None
-        vid = str(it.get("vod_id") or it.get("id") or "")
-        name = _clean(it.get("vod_name") or it.get("name"))
-        if not vid or not name:
-            return None
-        pic = _fix(it.get("vod_pic") or it.get("vod_pic_thumb") or "")
-        remarks = _clean(it.get("vod_remarks") or "")
-        if not remarks and it.get("vod_score") and str(it.get("vod_score")) not in ("0.0", "0"):
-            remarks = "评分 %s" % it.get("vod_score")
-        return {"vod_id": vid, "vod_name": name, "vod_pic": pic, "vod_remarks": remarks}
-
-    # ---------------------------------------------------------------- 分类
-    def categoryContent(self, tid, pg, filter, extend):
+    def _ensure(self):
+        if self._host:
+            return True
+        cache = Spider._shared
+        if cache["host"] and time.time() - cache["ts"] < 600:
+            self._host = cache["host"]
+            self._dyn_key = cache["key"]
+            return True
+        raw = self._http(CFG["boot"], timeout=10)
         try:
-            page = max(1, int(str(pg).strip() or 1))
+            host = _s(json.loads(raw.decode("utf-8")).get("domain")).rstrip("/")
         except Exception:
-            page = 1
-        ext = extend if isinstance(extend, dict) else {}
-        params = {"tid": str(tid), "pg": str(page), "limit": "20"}
-        for key, _ in FILTER_KEYS:
-            v = str(ext.get(key) or "").strip()
-            if v and v != "all":
-                params[key] = v
-        j = self._cms("video", params)
-        lst = [self._item(x) for x in (j.get("list") or [])]
-        lst = [x for x in lst if x]
+            host = ""
+        if not host:
+            return False
+        self._host = host
+        # 握手取动态签名公钥（失败则回退内置公钥）
         try:
-            pages = int(j.get("pagecount") or 0)
+            ts = int(time.time() * 1000)
+            r = _rand(16)
+            body = (_p_int(1, ts) + _p_bytes(2, _rsa_encrypt(str(ts) + r, CFG["public_key"]))
+                    + _p_bytes(3, _rand(16)) + _p_bytes(4, r) + _p_bytes(5, _rand(16)))
+            resp = self._http(self._host + "/api/v5/find/app/zone", "POST", body, self._headers(True, True))
+            zone = _parse(_one(_parse(resp), 3, b"") or b"")
+            self._dyn_key = "".join(_s(_one(zone, i)) for i in (2, 3, 4, 5))
         except Exception:
-            pages = 0
-        try:
-            limit = int(j.get("limit") or 20)
-        except Exception:
-            limit = 20
-        if pages <= 0:
-            pages = page + 1 if len(lst) >= limit else page
-        try:
-            total = int(j.get("total") or 0)
-        except Exception:
-            total = 0
-        return {"page": page, "pagecount": pages, "limit": limit,
-                "total": total, "list": lst}
+            self._dyn_key = ""
+        cache["host"] = self._host
+        cache["key"] = self._dyn_key
+        cache["ts"] = time.time()
+        return True
 
-    # ---------------------------------------------------------------- 详情
-    def detailContent(self, ids):
-        vid = str(ids[0] or "")
-        if not vid:
-            return {"list": []}
-        j = self._cms("video_detail", {"id": vid})
-        d = j.get("data") or {}
-        if not d:
-            return {"list": []}
-        froms = [x for x in str(d.get("vod_play_from") or "").split("$$$") if x]
-        raw_urls = [x for x in str(d.get("vod_play_url") or "").split("$$$")]
-        urls = []
-        for grp in raw_urls:
-            eps = []
-            for part in grp.split("#"):
-                part = part.strip()
-                if not part:
-                    continue
-                if "$" in part:
-                    t, u = part.split("$", 1)
-                else:
-                    t, u = "正片", part
-                t = _safe(t) or "正片"
-                u = u.strip()
-                if u:
-                    eps.append("%s$%s" % (t, u))
-            urls.append("#".join(eps))
-        while len(froms) < len(urls):
-            froms.append("线路%d" % (len(froms) + 1))
-        pairs = [(f, u) for f, u in zip(froms, urls) if u]
-        # 将 4K 线路置前，同时保持线路名与播放地址一一对应。
-        pairs.sort(key=lambda item: 0 if "4k" in item[0].lower() else 1)
-        vod = {
-            "vod_id": vid,
-            "vod_name": _clean(d.get("vod_name")),
-            "vod_pic": _fix(d.get("vod_pic") or d.get("vod_pic_thumb")),
-            "type_name": _clean(d.get("vod_class")),
-            "vod_year": str(d.get("vod_year") or ""),
-            "vod_area": _clean(d.get("vod_area")),
-            "vod_lang": _clean(d.get("vod_lang")),
-            "vod_remarks": _clean(d.get("vod_remarks")),
-            "vod_actor": _clean(d.get("vod_actor")),
-            "vod_director": _clean(d.get("vod_director")),
-            "vod_content": _clean(d.get("vod_content") or d.get("vod_blurb")),
-            "vod_play_from": "$$$".join([p[0] for p in pairs]),
-            "vod_play_url": "$$$".join([p[1] for p in pairs]),
+    def _headers(self, protobuf=True, no_sig=False):
+        ts = int(time.time() * 1000)
+        r = _rand(16)
+        uid = uuid.uuid4().hex.upper()
+        vapp = CFG["v_name"].replace(".", "")
+        device = {
+            "country": "CN", "vName": CFG["v_name"], "cpuId": "MT6893Z%2FCZA", "young": 0,
+            "facturer": "Xiaomi", "pkg": CFG["pkg"], "uuid": uid, "resolution": "1080x2272",
+            "mac": "02%3A00%3A00%3A00%3A00%3A00", "abid": "397", "model": "M2012K11AC",
+            "plat": "android", "udid": uid, "dpi": "440", "net": "1", "lang": "zh",
+            "brand": "Xiaomi", "density": "2.75", "appName": CFG["app_name"],
+            "cpu": "arm64-v8a", "chid": "10000", "carrier": "%E8%81%94%E9%80%9A",
+            "_vOsCode": 30, "vOs": "11", "v": 1, "tenantId": "", "vApp": vapp,
+            "device": 0, "androidID": uid.lower()[:16],
         }
-        if not pairs:
-            vod["vod_play_from"] = "网页"
-            vod["vod_play_url"] = "正片$%s/api.php/app/video_detail?id=%s" % (self.host, vid)
-        return {"list": [vod]}
+        if no_sig:
+            device["sig"] = _rsa_encrypt(str(ts) + r + vapp, CFG["public_key"])
+        else:
+            device["sig"] = _rsa_encrypt(str(ts) + r + vapp, self._dyn_key or CFG["public_key"])
+        device["random_str"] = r
+        device["timestamp"] = ts
+        sig = base64.b64encode(_aes_ecb((str(ts) + r).encode("utf-8"), CFG["data_iv"].encode("ascii"))).decode()
+        device["sig2"] = sig[:8]
+        device["sig3"] = sig[8:]
+        params = _aes_cbc(json.dumps(device, separators=(",", ":")).encode("utf-8"),
+                          CFG["device_key"].encode("ascii")).hex()
+        return {
+            "User-Agent": UA,
+            "Accept": "application/x-protobuf" if protobuf else "application/json",
+            "Content-Type": "application/x-protobuf" if protobuf else "application/json; charset=utf-8",
+            "publicParams": '{"paramsData":"%s"}' % params,
+        }
 
-    # ---------------------------------------------------------------- 搜索
-    def searchContent(self, key, quick, pg="1"):
+    def _secure(self, params):
+        ts = int(time.time() * 1000)
+        r = _rand(8)
+        fake = _rand(20)
+        query = "&".join("%s=%s" % (k, v) for k, v in params.items()
+                         if v is not None and str(v) != "")
+        enc = r + base64.b64encode(_aes_ecb((query + str(ts)).encode("utf-8"),
+                                            CFG["safe_code"].encode("ascii"))).decode()
+        return (_p_bytes(1, enc[:20]) + _p_bytes(2, enc[20:]) + _p_bytes(3, fake)
+                + _p_int(4, ts) + _p_bytes(5, r))
+
+    def _post(self, path, body):
+        return self._http(self._host + path, "POST", body, self._headers(True))
+
+    def _api(self, path, params, retry=True):
+        if not self._ensure():
+            return {}
         try:
-            page = max(1, int(str(pg).strip() or 1))
+            outer = _parse(self._post(path, self._secure(params)))
+            msg = _s(_one(outer, 2))
+            data = _parse(_one(outer, 3, b"") or b"")
+            if data:
+                return data
+            # 域名或动态公钥失效（RSA/签名类错误）时清缓存重来一次
+            if retry and ("RSA" in msg or "签名" in msg or "过期" in msg):
+                Spider._shared.update({"host": "", "key": "", "ts": 0})
+                self._host = ""
+                self._dyn_key = ""
+                return self._api(path, params, False)
+            return data
         except Exception:
-            page = 1
-        j = self._cms("search", {"text": str(key or ""), "pg": str(page)})
-        lst = [self._item(x) for x in (j.get("list") or [])]
-        return {"list": [x for x in lst if x], "page": page}
+            return {}
 
-    # ---------------------------------------------------------------- 播放
-    def playerContent(self, flag, id, vipFlags):
-        url = str(id or "").strip()
+    def _json(self, path):
+        if not self._ensure():
+            return {}
         try:
-            if url.startswith("lvdou+"):
-                url = self._decrypt_lvdou(url) or url
-            if MEDIA_RE.search(url):
-                host = urllib.parse.urlparse(url).hostname or ""
-                if YT4K_HOST.search(host) or "lyyytv.cn" in host:
-                    real = self._chain(url)
-                    if real:
-                        return {"parse": 0, "playUrl": "", "url": real,
-                                "header": '{"User-Agent":"%s"}' % UA}
-                return {"parse": 0, "playUrl": "", "url": url,
-                        "header": '{"User-Agent":"%s"}' % UA}
-            real = self._parse(url)
-            if real:
-                return {"parse": 0, "playUrl": "", "url": real,
-                        "header": '{"User-Agent":"%s"}' % UA}
-            if url.startswith("http"):
-                return {"parse": 1, "playUrl": "", "url": url, "header": ""}
+            return json.loads(self._http(self._host + path, "GET", None, self._headers(False)).decode("utf-8"))
         except Exception:
-            pass
-        return {"parse": 1, "playUrl": "", "url": url, "header": ""}
+            return {}
 
-    def _decrypt_lvdou(self, s):
-        """lvdou+<b64> → AES-CBC(key=CMS_KEY[0:16], iv=CMS_KEY[16:32])"""
-        key = CMS_KEY[:16].encode()
-        iv = (CMS_KEY[16:32] if len(CMS_KEY) >= 32 else CMS_KEY[:16]).encode()
-        body = s[6:].strip()
+    # ---- 解析 ----------------------------------------------------------
+    def _cover(self, raw):
+        if not isinstance(raw, bytes) or not raw:
+            return ""
         try:
-            raw = base64.b64decode(body + "=" * (-len(body) % 4))
-            out = _aes_cbc_dec(raw, key, iv).decode("utf-8", "ignore")
-            return out if out.startswith("http") else ""
+            f = _parse(raw)
         except Exception:
             return ""
+        for num in (2, 1):
+            url = _s(_one(f, num))
+            if url.startswith("http") and "$" not in url and len(url) < 300:
+                if re.search(r"\.(?:jpe?g|png|webp|gif|bmp|avif)(?:\?|$)", url, re.I) or "img" in url:
+                    return url
+        return ""
 
-    def _chain(self, media_url):
-        j = self._get(CHAIN_API + urllib.parse.quote(media_url, safe=""), timeout=25)
-        return _decrypt_baidu(str(j.get("url") or ""))
+    def _vod(self, raw):
+        f = _parse(raw)
+        name = _s(_one(f, 5))
+        if not name:
+            return None
+        return {
+            "vod_id": _s(_one(f, 3)),
+            "vod_name": name,
+            "vod_pic": self._cover(_one(f, 2)),
+            "vod_remarks": _s(_one(f, 13)),
+            "vod_year": _s(_one(f, 14)),
+            "vod_area": _s(_one(f, 1)),
+            "type_name": _s(_one(f, 15)).split(",")[-1],
+        }
 
-    def _parse(self, page_url):
-        j = self._get(PARSE_API + urllib.parse.quote(page_url, safe=""), timeout=25)
-        url = str(j.get("url") or "")
-        if url.startswith(DEC_PREFIX):
-            return _decrypt_baidu(url)
-        return url if url.startswith("http") else ""
+    def _list(self, fields):
+        out = []
+        seen = set()
+        for raw in fields.get(1, []) or []:
+            try:
+                item = self._vod(raw)
+            except Exception:
+                continue
+            if not item or not item["vod_id"] or item["vod_id"] in seen:
+                continue
+            seen.add(item["vod_id"])
+            out.append(item)
+        return out
+
+    # ---- 接口 ----------------------------------------------------------
+    def homeContent(self, filter):
+        try:
+            cats = []
+            data = self._json("/api/v3/drama/getCategory?orderBy=type_id")
+            for item in data.get("data") or []:
+                if not item.get("id") or item.get("name") == "公告":
+                    continue
+                cats.append({"type_id": _s(item.get("id")), "type_name": _s(item.get("name"))})
+            if not cats:
+                cats = [
+                    {"type_id": "21", "type_name": "电影"}, {"type_id": "22", "type_name": "剧集"},
+                    {"type_id": "25", "type_name": "动漫"}, {"type_id": "26", "type_name": "综艺"},
+                    {"type_id": "27", "type_name": "短剧"}, {"type_id": "28", "type_name": "漫剧"},
+                    {"type_id": "29", "type_name": "直播"}, {"type_id": "30", "type_name": "纪录片"},
+                ]
+            return {"class": cats, "filters": self._filters(cats)}
+        except Exception:
+            return {"class": [], "filters": {}}
+
+    def _filters(self, cats):
+        order = _opt("排序", ["最新", "最热", "评分"])
+        cls = _opt("类型", ["动作", "喜剧", "爱情", "科幻", "恐怖", "剧情", "战争", "犯罪",
+                            "悬疑", "动画", "纪录片", "伦理", "冒险", "奇幻"])
+        area = _opt("地区", ["内地", "香港", "台湾", "美国", "韩国", "日本", "泰国",
+                             "印度", "法国", "英国", "德国", "其他"])
+        year = _opt("年份", [str(y) for y in range(2026, 2014, -1)])
+        lang = _opt("语言", ["国语", "英语", "日语", "韩语", "粤语", "法语"])
+        out = {}
+        for c in cats:
+            tid = c["type_id"]
+            if tid == "29":                      # 直播没有筛选
+                out[tid] = []
+            elif tid in ("27", "28"):            # 短剧/漫剧：语言维度无数据
+                out[tid] = [cls, area, year, order]
+            else:
+                out[tid] = [cls, area, year, lang, order]
+        return out
+
+    def homeVideoContent(self):
+        try:
+            f = self._api("/api/proto/v5/drama/category", {
+                "pagesize": "21", "typeId1": "21", "page": "1",
+                "vodOrderBy": "最热", "vodArea": "", "vodLang": "", "vodClass": "", "vodYear": "",
+            })
+            return {"list": self._list(f)}
+        except Exception:
+            return {"list": []}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        try:
+            ext = extend or {}
+            page = max(1, int(str(pg).isdigit() and pg or 1))
+            params = {
+                "pagesize": "21",
+                "typeId1": _s(tid),
+                "page": str(page),
+                "vodOrderBy": _s(ext.get("排序")) or "最新",
+                "vodArea": _s(ext.get("地区")),
+                "vodLang": _s(ext.get("语言")),
+                "vodClass": _s(ext.get("类型")),
+                "vodYear": _s(ext.get("年份")),
+            }
+            items = self._list(self._api("/api/proto/v5/drama/category", params))
+            pagecount = page + 1 if len(items) >= 21 else page
+            return {"list": items, "page": page, "pagecount": pagecount,
+                    "limit": 21, "total": pagecount * 21 if items else 0}
+        except Exception:
+            return {"list": [], "page": 1, "pagecount": 1, "limit": 21, "total": 0}
+
+    def detailContent(self, ids):
+        try:
+            vid = _s(ids[0] if isinstance(ids, (list, tuple)) else ids).strip()
+            f = self._api("/api/proto/v5/drama/getDetail", {"id": vid})
+            if not f:
+                return {"list": []}
+            groups = {}
+            order = []
+            for raw in f.get(29, []) or []:
+                try:
+                    ep = _parse(raw)
+                except Exception:
+                    continue
+                path = _s(_one(ep, 4))
+                if not path:
+                    continue
+                title = _s(_one(ep, 3)) or _s(_one(ep, 2)) or "第1集"
+                source = _s(_one(ep, 9))
+                quality = _s(_one(ep, 10)) or source or "未知"
+                name = "%s (%s)" % (quality, source) if source and quality != source else quality
+                name = name.replace("$", "").replace("#", "")
+                title = title.replace("$", "").replace("#", "")
+                if MEDIA_RE.search(path):
+                    token = path
+                else:
+                    payload = "%s\n%s" % (source, path)          # 线路源 + 播放标识
+                    token = base64.urlsafe_b64encode(payload.encode("utf-8")).decode().rstrip("=")
+                if name not in groups:
+                    groups[name] = []
+                    order.append(name)
+                groups[name].append("%s$%s" % (title, token))
+            if not groups:
+                return {"list": [{
+                    "vod_id": vid, "vod_name": _s(_one(f, 9)), "vod_pic": self._cover(_one(f, 2)),
+                    "vod_actor": _s(_one(f, 25)), "vod_director": _s(_one(f, 12)),
+                    "vod_area": _s(_one(f, 1)), "vod_year": _s(_one(f, 18)),
+                    "vod_remarks": _s(_one(f, 26)), "vod_content": _clean_html(_one(f, 6)),
+                    "vod_play_from": "", "vod_play_url": "",
+                }]}
+
+            def rank(name):
+                low = name.lower()
+                if "4k" in low:
+                    return 0
+                if "蓝光" in low:
+                    return 1
+                if "超清" in low or "高清" in low:
+                    return 2
+                return 3
+
+            names = sorted(order, key=lambda x: (rank(x), order.index(x)))
+            vod = {
+                "vod_id": vid,
+                "vod_name": _s(_one(f, 9)),
+                "vod_pic": self._cover(_one(f, 2)),
+                "vod_actor": _s(_one(f, 25)),
+                "vod_director": _s(_one(f, 12)),
+                "vod_area": _s(_one(f, 1)),
+                "vod_year": _s(_one(f, 18)),
+                "vod_remarks": _s(_one(f, 26)),
+                "vod_content": _clean_html(_one(f, 6)),
+                "vod_play_from": "$$$".join(names),
+                "vod_play_url": "$$$".join("#".join(groups[n]) for n in names),
+            }
+            return {"list": [vod]}
+        except Exception:
+            return {"list": []}
+
+    def searchContent(self, key, quick, pg="1"):
+        try:
+            page = max(1, int(str(pg).isdigit() and pg or 1))
+            f = self._api("/api/proto/v5/drama/search", {
+                "searchKeys": _s(key), "page": str(page), "pagesize": "21",
+            })
+            items = self._list(f)
+            return {"list": items, "page": page,
+                    "pagecount": page + 1 if len(items) >= 21 else page}
+        except Exception:
+            return {"list": [], "page": 1, "pagecount": 1}
+
+    def playerContent(self, flag, pid, vipFlags):
+        try:
+            vid = _s(pid).strip()
+            if MEDIA_RE.search(vid):
+                return {"parse": 0, "url": vid, "header": {"User-Agent": UA}}
+            raw = vid
+            pad = "=" * (-len(raw) % 4)
+            try:
+                plain = base64.urlsafe_b64decode(raw + pad).decode("utf-8", "ignore")
+            except Exception:
+                try:
+                    plain = base64.b64decode(raw + pad).decode("utf-8", "ignore")
+                except Exception:
+                    return {"parse": 1, "url": vid, "header": {"User-Agent": UA}}
+            if "\n" not in plain:
+                return {"parse": 1, "url": vid, "header": {"User-Agent": UA}}
+            source, path = plain.split("\n", 1)
+            f = self._api("/api/proto/v5/videoUsableUrl", {
+                "vodPlayFrom": source, "playUrl": path,
+            })
+            url = _s(_one(f, 1))
+            if not url:
+                return {"parse": 1, "url": vid, "header": {"User-Agent": UA}}
+            header = {"User-Agent": UA}
+            for raw_h in f.get(6, []) or []:
+                try:
+                    h = _parse(raw_h)
+                except Exception:
+                    continue
+                k = _s(_one(h, 1))
+                v = _s(_one(h, 2))
+                if k and k.lower() not in ("user-agent", "host", "content-length", "accept-encoding"):
+                    header[k] = v
+            return {"parse": 0, "url": url, "header": header}
+        except Exception:
+            return {"parse": 1, "url": _s(pid), "header": {"User-Agent": UA}}
+
+
+def _opt(name, values):
+    return {"key": name, "name": name, "value": [{"n": "全部", "v": ""}] +
+            [{"n": v, "v": v} for v in values]}
